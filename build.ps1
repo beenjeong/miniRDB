@@ -32,9 +32,7 @@ if (-not $cl) {
         $sources = (Get-ChildItem "$srcDir\*.c" | ForEach-Object { $_.FullName }) -join " "
         $exe = Join-Path $buildDir "minirdb.exe"
         $cmd = "call `"$vcvarsall`" x64 >nul && cl.exe /nologo /W3 /std:c17 /D_CRT_SECURE_NO_WARNINGS /Zi /I`"$srcDir`" $sources /Fe:`"$exe`" /Fo:`"$buildDir\\`""
-        $tmpBat = Join-Path $buildDir "_build.bat"
-        Set-Content -Path $tmpBat -Value $cmd -Encoding ASCII
-        & cmd.exe /c $tmpBat
+        & cmd.exe /c $cmd
         if ($LASTEXITCODE -ne 0) { throw "MSVC build failed with exit code $LASTEXITCODE" }
         Write-Host "Built $exe"
         exit 0
