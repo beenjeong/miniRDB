@@ -6,8 +6,5 @@
 *.ilk
 vc140.pdb
 
-# Database files
-*.db
-
 # Node
 web/node_modules/
