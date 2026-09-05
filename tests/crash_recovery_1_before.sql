@@ -1,0 +1,5 @@
+CREATE TABLE t (id INT PRIMARY KEY, v TEXT);
+INSERT INTO t VALUES (1, 'committed');
+BEGIN;
+INSERT INTO t VALUES (2, 'uncommitted');
+SELECT * FROM t ORDER BY id;
