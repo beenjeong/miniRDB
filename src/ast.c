@@ -19,6 +19,9 @@ void expr_free(Expr *e) {
         case EXPR_FUNC:
             expr_free(e->as.func.arg);
             break;
+        case EXPR_SUBQUERY:
+            stmt_free(e->as.subquery.stmt);
+            break;
     }
     free(e);
 }
@@ -43,6 +46,8 @@ void stmt_free(Stmt *s) {
             for (int i = 0; i < s->as.select.num_items; i++) expr_free(s->as.select.items[i].expr);
             for (int i = 0; i < s->as.select.num_from; i++) expr_free(s->as.select.from[i].on_cond);
             expr_free(s->as.select.where);
+            for (int i = 0; i < s->as.select.num_groupby; i++) expr_free(s->as.select.groupby[i]);
+            expr_free(s->as.select.having);
             for (int i = 0; i < s->as.select.num_orderby; i++) expr_free(s->as.select.orderby[i].expr);
             break;
         case STMT_UPDATE:

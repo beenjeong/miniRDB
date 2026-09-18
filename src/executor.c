@@ -8,6 +8,7 @@
 #include <stdio.h>
 
 #define MAX_OUTCOLS 512
+#define MAX_GROUP_AGG 64
 
 /* ================= row context & expression evaluation ================= */
 
@@ -18,10 +19,16 @@ typedef struct {
     int64_t rowid;
 } BoundTable;
 
-typedef struct {
+typedef struct RowContext {
     BoundTable tables[MAX_JOINS + 1];
     int num_tables;
+    Database *db;              /* needed to execute a scalar subquery found while evaluating this context */
+    struct RowContext *outer;  /* enclosing query's context, for correlated subqueries; NULL at top level */
 } RowContext;
+
+/* Forward decl: eval_expr()'s EXPR_SUBQUERY case runs the subquery via a
+   nested exec_select() call, correlated to the context it was found in. */
+static int exec_select(Database *db, SelectStmt *sel, ResultSet *rs, char *msg, size_t msgsz, RowContext *outer);
 
 static Value *row_buffer_alloc(TableDef *t) {
     Value *v = (Value *)xmalloc(sizeof(Value) * (t->num_columns > 0 ? t->num_columns : 1));
@@ -36,6 +43,23 @@ static void row_buffer_free(TableDef *t, Value *v) {
     free(v);
 }
 
+/* While non-NULL, eval_expr() resolves EXPR_FUNC nodes matching one of
+   `exprs` (by pointer identity) to the precomputed `values` entry instead of
+   erroring out. Used to evaluate HAVING/ORDER BY/output expressions against
+   already-finalized per-group aggregates. */
+typedef struct {
+    const Expr **exprs;
+    Value *values;
+    int n;
+} GroupHavingCtx;
+
+static GroupHavingCtx *g_having_ctx = NULL;
+
+/* Resolves a column reference against `ctx`, falling back to enclosing
+   query contexts (ctx->outer) when not found here; this is what lets a
+   subquery correlate to its outer query's columns. Inner scope always
+   shadows outer: a match (or an ambiguity) in `ctx` itself is decided
+   without ever looking further out. */
 static int resolve_column(RowContext *ctx, const char *qualifier, const char *column, Value **out_val) {
     if (qualifier[0]) {
         for (int i = 0; i < ctx->num_tables; i++) {
@@ -48,6 +72,7 @@ static int resolve_column(RowContext *ctx, const char *qualifier, const char *co
                 return -1;
             }
         }
+        if (ctx->outer) return resolve_column(ctx->outer, qualifier, column, out_val);
         set_error("no such table or alias '%s'", qualifier);
         return -1;
     }
@@ -58,10 +83,11 @@ static int resolve_column(RowContext *ctx, const char *qualifier, const char *co
             if (strcmp(t->columns[c].name, column) == 0) { found = &ctx->tables[i].values[c]; matches++; }
         }
     }
-    if (matches == 0) { set_error("no such column '%s'", column); return -1; }
+    if (matches == 1) { *out_val = found; return 0; }
     if (matches > 1) { set_error("ambiguous column '%s'", column); return -1; }
-    *out_val = found;
-    return 0;
+    if (ctx->outer) return resolve_column(ctx->outer, qualifier, column, out_val);
+    set_error("no such column '%s'", column);
+    return -1;
 }
 
 static int arith_binary(OpKind op, const Value *l, const Value *r, Value *out) {
@@ -170,8 +196,34 @@ static int eval_expr(const Expr *e, RowContext *ctx, Value *out) {
             return rc;
         }
         case EXPR_FUNC:
+            if (g_having_ctx) {
+                for (int i = 0; i < g_having_ctx->n; i++) {
+                    if (g_having_ctx->exprs[i] == e) { *out = value_clone(&g_having_ctx->values[i]); return 0; }
+                }
+            }
             set_error("aggregate functions are not allowed in WHERE/ON or without other aggregates");
             return -1;
+        case EXPR_SUBQUERY: {
+            ResultSet rs; char subq_msg[128];
+            if (exec_select(ctx->db, &e->as.subquery.stmt->as.select, &rs, subq_msg, sizeof(subq_msg), ctx) != 0)
+                return -1;
+            if (rs.num_columns != 1) {
+                result_set_free(&rs);
+                set_error("scalar subquery must return exactly one column");
+                return -1;
+            }
+            if (rs.num_rows == 0) {
+                *out = value_null();
+            } else if (rs.num_rows > 1) {
+                result_set_free(&rs);
+                set_error("scalar subquery returned more than one row");
+                return -1;
+            } else {
+                *out = value_clone(&rs.rows[0][0]);
+            }
+            result_set_free(&rs);
+            return 0;
+        }
     }
     return -1;
 }
@@ -213,6 +265,7 @@ static bool expr_refs_only(const Expr *e, RowContext *ctx_so_far) {
         case EXPR_UNARY: return expr_refs_only(e->as.bin.left, ctx_so_far);
         case EXPR_BINARY: return expr_refs_only(e->as.bin.left, ctx_so_far) && expr_refs_only(e->as.bin.right, ctx_so_far);
         case EXPR_FUNC: return e->as.func.arg ? expr_refs_only(e->as.func.arg, ctx_so_far) : true;
+        case EXPR_SUBQUERY: return true; /* self-contained; correlates via RowContext.outer at eval time */
     }
     return false;
 }
@@ -385,7 +438,7 @@ static int exec_insert(Database *db, InsertStmt *ins, char *msg, size_t msgsz) {
         for (int i = 0; i < t->num_columns; i++) col_map[i] = i;
     }
 
-    RowContext empty_ctx; empty_ctx.num_tables = 0;
+    RowContext empty_ctx; empty_ctx.num_tables = 0; empty_ctx.db = db; empty_ctx.outer = NULL;
     int inserted = 0;
     for (int r = 0; r < ins->num_rows; r++) {
         int provided = ins->row_lengths[r];
@@ -447,6 +500,7 @@ typedef struct {
     const Expr *plan_probe_expr[MAX_JOINS + 1];
 
     bool is_aggregate;
+    bool is_groupby;
 
     /* output column plan */
     int num_outcols;
@@ -455,6 +509,14 @@ typedef struct {
     int outcol_col[MAX_OUTCOLS];
     Expr *outcol_expr[MAX_OUTCOLS];
     char outcol_name[MAX_OUTCOLS][MAX_NAME];
+    int outcol_agg_index[MAX_OUTCOLS]; /* GROUP BY only: index into combined_agg_expr, or -1 */
+
+    /* GROUP BY: every aggregate call referenced by the output list, HAVING,
+       or ORDER BY, tracked once per group as an AggState */
+    int num_combined_agg;
+    const Expr *combined_agg_expr[MAX_GROUP_AGG];
+    struct GroupEntry *groups;
+    int group_count, group_cap;
 
     ResultRow *rows;
     int count, cap;
@@ -467,8 +529,14 @@ typedef struct {
     Value minv, maxv;
 } AggState;
 
+typedef struct GroupEntry {
+    Value *key;          /* sel->num_groupby values; NULL when num_groupby == 0 */
+    RowContext snapshot;  /* deep-cloned row context of the first row seen in this group */
+    AggState *agg;        /* se->num_combined_agg entries */
+} GroupEntry;
+
 static void plan_from(SelectExec *se) {
-    RowContext schema_ctx; schema_ctx.num_tables = 0;
+    RowContext schema_ctx; schema_ctx.num_tables = 0; schema_ctx.db = se->db; schema_ctx.outer = NULL;
     for (int level = 0; level < se->sel->num_from; level++) {
         FromItem *fi = &se->sel->from[level];
         TableDef *table = catalog_find_table(&se->db->catalog, fi->table);
@@ -488,6 +556,29 @@ static void plan_from(SelectExec *se) {
     }
 }
 
+/* Walks an expression tree collecting every EXPR_FUNC node into `out`
+   (by pointer), used to find every aggregate call referenced by a GROUP BY
+   query's HAVING/ORDER BY clauses (which, unlike select-list items, may
+   nest an aggregate call anywhere in the tree). */
+static void collect_funcs(const Expr *e, const Expr **out, int *n, int max) {
+    if (!e) return;
+    switch (e->kind) {
+        case EXPR_FUNC:
+            if (*n < max) out[(*n)++] = e;
+            if (e->as.func.arg) collect_funcs(e->as.func.arg, out, n, max);
+            return;
+        case EXPR_UNARY:
+            collect_funcs(e->as.bin.left, out, n, max);
+            return;
+        case EXPR_BINARY:
+            collect_funcs(e->as.bin.left, out, n, max);
+            collect_funcs(e->as.bin.right, out, n, max);
+            return;
+        default:
+            return;
+    }
+}
+
 static int build_output_plan(SelectExec *se) {
     SelectStmt *sel = se->sel;
     bool has_agg = false, has_plain = false;
@@ -496,11 +587,12 @@ static int build_output_plan(SelectExec *se) {
         else if (sel->items[i].expr->kind == EXPR_FUNC) has_agg = true;
         else has_plain = true;
     }
-    if (has_agg && has_plain) {
+    se->is_groupby = sel->num_groupby > 0 || sel->having != NULL;
+    if (has_agg && has_plain && !se->is_groupby) {
         set_error("mixing aggregate and non-aggregate columns without GROUP BY is not supported");
         return -1;
     }
-    se->is_aggregate = has_agg;
+    se->is_aggregate = has_agg && !se->is_groupby;
 
     int n = 0;
     for (int i = 0; i < sel->num_items; i++) {
@@ -538,6 +630,20 @@ static int build_output_plan(SelectExec *se) {
         }
     }
     se->num_outcols = n;
+
+    if (se->is_groupby) {
+        se->num_combined_agg = 0;
+        for (int i = 0; i < n; i++) {
+            se->outcol_agg_index[i] = -1;
+            if (!se->outcol_direct[i] && se->outcol_expr[i]->kind == EXPR_FUNC && se->num_combined_agg < MAX_GROUP_AGG) {
+                se->outcol_agg_index[i] = se->num_combined_agg;
+                se->combined_agg_expr[se->num_combined_agg++] = se->outcol_expr[i];
+            }
+        }
+        if (sel->having) collect_funcs(sel->having, se->combined_agg_expr, &se->num_combined_agg, MAX_GROUP_AGG);
+        for (int i = 0; i < sel->num_orderby; i++)
+            collect_funcs(sel->orderby[i].expr, se->combined_agg_expr, &se->num_combined_agg, MAX_GROUP_AGG);
+    }
     return 0;
 }
 
@@ -568,6 +674,113 @@ static void agg_update(AggState *st, FuncKind fn, const Expr *arg, bool star, Ro
         default: break;
     }
     value_free(&v);
+}
+
+/* Reduces a finished AggState to its output Value and releases any
+   MIN/MAX-held clone. Safe to call at most once per AggState. */
+static Value agg_finalize(FuncKind fn, AggState *st) {
+    Value out;
+    switch (fn) {
+        case FUNC_COUNT: out = value_int(st->count); break;
+        case FUNC_SUM: out = st->any ? value_real(st->sum) : value_null(); break;
+        case FUNC_AVG: out = st->count > 0 ? value_real(st->sum / (double)st->count) : value_null(); break;
+        case FUNC_MIN: out = st->any ? value_clone(&st->minv) : value_null(); break;
+        case FUNC_MAX: out = st->any ? value_clone(&st->maxv) : value_null(); break;
+        default: out = value_null(); break;
+    }
+    if (st->any && (fn == FUNC_MIN || fn == FUNC_MAX)) { value_free(&st->minv); value_free(&st->maxv); }
+    return out;
+}
+
+/* ================= GROUP BY ================= */
+
+static RowContext clone_row_context(RowContext *ctx) {
+    RowContext copy;
+    copy.num_tables = ctx->num_tables;
+    copy.db = ctx->db;
+    copy.outer = ctx->outer;
+    for (int i = 0; i < ctx->num_tables; i++) {
+        TableDef *t = ctx->tables[i].table;
+        copy.tables[i].table = t;
+        strncpy(copy.tables[i].alias, ctx->tables[i].alias, MAX_NAME - 1);
+        copy.tables[i].alias[MAX_NAME - 1] = '\0';
+        copy.tables[i].rowid = ctx->tables[i].rowid;
+        Value *vals = row_buffer_alloc(t);
+        for (int c = 0; c < t->num_columns; c++) vals[c] = value_clone(&ctx->tables[i].values[c]);
+        copy.tables[i].values = vals;
+    }
+    return copy;
+}
+
+static void free_row_context(RowContext *ctx) {
+    for (int i = 0; i < ctx->num_tables; i++) row_buffer_free(ctx->tables[i].table, ctx->tables[i].values);
+}
+
+/* Buckets the current row (se->ctx) into its GROUP BY group, creating one
+   with a cloned snapshot of the row on first sight, then folds the row into
+   every aggregate referenced by the output list/HAVING/ORDER BY. */
+static int group_row(SelectExec *se) {
+    SelectStmt *sel = se->sel;
+    Value keybuf[MAX_GROUPBY];
+    for (int i = 0; i < sel->num_groupby; i++) {
+        if (eval_expr(sel->groupby[i], &se->ctx, &keybuf[i]) != 0) {
+            for (int j = 0; j < i; j++) value_free(&keybuf[j]);
+            return -1;
+        }
+    }
+
+    GroupEntry *g = NULL;
+    for (int i = 0; i < se->group_count && !g; i++) {
+        bool match = true;
+        for (int k = 0; k < sel->num_groupby; k++) {
+            if (value_compare(&keybuf[k], &se->groups[i].key[k]) != 0) { match = false; break; }
+        }
+        if (match) g = &se->groups[i];
+    }
+
+    if (!g) {
+        if (se->group_count >= se->group_cap) {
+            int newcap = se->group_cap ? se->group_cap * 2 : 16;
+            se->groups = (GroupEntry *)xrealloc(se->groups, sizeof(GroupEntry) * newcap);
+            se->group_cap = newcap;
+        }
+        g = &se->groups[se->group_count++];
+        if (sel->num_groupby > 0) {
+            g->key = (Value *)xmalloc(sizeof(Value) * sel->num_groupby);
+            for (int k = 0; k < sel->num_groupby; k++) g->key[k] = keybuf[k]; /* ownership transferred */
+        } else {
+            g->key = NULL;
+        }
+        g->snapshot = clone_row_context(&se->ctx);
+        int nagg = se->num_combined_agg > 0 ? se->num_combined_agg : 1;
+        g->agg = (AggState *)xmalloc(sizeof(AggState) * nagg);
+        memset(g->agg, 0, sizeof(AggState) * nagg);
+    } else {
+        for (int k = 0; k < sel->num_groupby; k++) value_free(&keybuf[k]);
+    }
+
+    int err = 0;
+    for (int i = 0; i < se->num_combined_agg; i++) {
+        const Expr *fe = se->combined_agg_expr[i];
+        agg_update(&g->agg[i], fe->as.func.fn, fe->as.func.arg, fe->as.func.star, &se->ctx, &err);
+        if (err) return -1;
+    }
+    return 0;
+}
+
+static void free_groups(SelectExec *se) {
+    for (int i = 0; i < se->group_count; i++) {
+        GroupEntry *g = &se->groups[i];
+        if (g->key) {
+            for (int k = 0; k < se->sel->num_groupby; k++) value_free(&g->key[k]);
+            free(g->key);
+        }
+        free_row_context(&g->snapshot);
+        free(g->agg);
+    }
+    free(se->groups);
+    se->groups = NULL;
+    se->group_count = se->group_cap = 0;
 }
 
 static AggState *g_agg_states = NULL; /* only used while is_aggregate; sized num_outcols */
@@ -618,12 +831,91 @@ static int emit_row(SelectExec *se) {
     return 0;
 }
 
+/* Runs once GROUP BY row collection is done: finalizes each group's
+   aggregates, applies HAVING, and appends surviving groups to se->rows in
+   the same ResultRow shape emit_row() produces, so the ORDER BY/LIMIT/
+   output logic in exec_select() needs no GROUP BY-specific handling. */
+static int finalize_groups(SelectExec *se) {
+    for (int gi = 0; gi < se->group_count; gi++) {
+        GroupEntry *g = &se->groups[gi];
+
+        Value finalized[MAX_GROUP_AGG];
+        for (int i = 0; i < se->num_combined_agg; i++)
+            finalized[i] = agg_finalize(se->combined_agg_expr[i]->as.func.fn, &g->agg[i]);
+        GroupHavingCtx hctx = { se->combined_agg_expr, finalized, se->num_combined_agg };
+        /* Save/restore rather than reset to NULL: evaluating this group's
+           HAVING/output/ORDER BY expressions may run a nested scalar
+           subquery (another exec_select call) that is itself a GROUP BY
+           query, which would otherwise clobber this global mid-group. */
+        GroupHavingCtx *saved_having_ctx = g_having_ctx;
+        g_having_ctx = &hctx;
+
+        bool keep = true, failed = false;
+        if (se->sel->having) {
+            Value hv;
+            if (eval_expr(se->sel->having, &g->snapshot, &hv) != 0) {
+                failed = true;
+            } else {
+                keep = hv.type != VAL_NULL && value_truthy(&hv);
+                value_free(&hv);
+            }
+        }
+
+        if (!failed && keep && !(se->sel->has_limit && !se->sel->num_orderby && se->count >= se->sel->limit)) {
+            if (se->count >= se->cap) {
+                int newcap = se->cap ? se->cap * 2 : 64;
+                se->rows = (ResultRow *)xrealloc(se->rows, sizeof(ResultRow) * newcap);
+                se->cap = newcap;
+            }
+            ResultRow *rr = &se->rows[se->count];
+            rr->proj = (Value *)xmalloc(sizeof(Value) * (se->num_outcols > 0 ? se->num_outcols : 1));
+            for (int i = 0; i < se->num_outcols && !failed; i++) {
+                if (se->outcol_agg_index[i] >= 0) {
+                    rr->proj[i] = value_clone(&finalized[se->outcol_agg_index[i]]);
+                } else if (se->outcol_direct[i]) {
+                    rr->proj[i] = value_clone(&g->snapshot.tables[se->outcol_table[i]].values[se->outcol_col[i]]);
+                } else if (eval_expr(se->outcol_expr[i], &g->snapshot, &rr->proj[i]) != 0) {
+                    free(rr->proj);
+                    failed = true;
+                }
+            }
+            if (!failed) {
+                if (se->sel->num_orderby > 0) {
+                    rr->orderkeys = (Value *)xmalloc(sizeof(Value) * se->sel->num_orderby);
+                    for (int i = 0; i < se->sel->num_orderby; i++) {
+                        if (eval_expr(se->sel->orderby[i].expr, &g->snapshot, &rr->orderkeys[i]) != 0) {
+                            for (int j = 0; j < i; j++) value_free(&rr->orderkeys[j]);
+                            free(rr->orderkeys);
+                            for (int j = 0; j < se->num_outcols; j++) value_free(&rr->proj[j]);
+                            free(rr->proj);
+                            failed = true;
+                            break;
+                        }
+                    }
+                } else {
+                    rr->orderkeys = NULL;
+                }
+            }
+            if (!failed) {
+                rr->seq = se->count;
+                se->count++;
+            }
+        }
+
+        for (int i = 0; i < se->num_combined_agg; i++) value_free(&finalized[i]);
+        g_having_ctx = saved_having_ctx;
+        if (failed) return -1;
+    }
+    return 0;
+}
+
 static int exec_from_level(SelectExec *se, int level) {
     if (level == se->sel->num_from) {
         bool keep = true;
         if (eval_where(se->sel->where, &se->ctx, &keep) != 0) return -1;
-        if (keep) return emit_row(se);
-        return 0;
+        if (!keep) return 0;
+        if (se->is_groupby) return group_row(se);
+        return emit_row(se);
     }
 
     FromItem *fi = &se->sel->from[level];
@@ -714,7 +1006,7 @@ static int result_row_cmp(const void *pa, const void *pb) {
     return orderby_compare(g_sort_sel, (const ResultRow *)pa, (const ResultRow *)pb);
 }
 
-static int exec_select(Database *db, SelectStmt *sel, ResultSet *rs, char *msg, size_t msgsz) {
+static int exec_select(Database *db, SelectStmt *sel, ResultSet *rs, char *msg, size_t msgsz, RowContext *outer) {
     for (int i = 0; i < sel->num_from; i++) {
         if (!catalog_find_table(&db->catalog, sel->from[i].table)) {
             set_error("no such table '%s'", sel->from[i].table);
@@ -726,6 +1018,8 @@ static int exec_select(Database *db, SelectStmt *sel, ResultSet *rs, char *msg, 
     se.db = db;
     se.sel = sel;
     se.ctx.num_tables = 0;
+    se.ctx.db = db;
+    se.ctx.outer = outer;
     for (int i = 0; i < sel->num_from; i++) {
         se.ctx.tables[i].table = catalog_find_table(&db->catalog, sel->from[i].table);
         strncpy(se.ctx.tables[i].alias, sel->from[i].alias[0] ? sel->from[i].alias : sel->from[i].table, MAX_NAME - 1);
@@ -736,7 +1030,12 @@ static int exec_select(Database *db, SelectStmt *sel, ResultSet *rs, char *msg, 
     se.ctx.num_tables = 0;
     plan_from(&se);
 
+    /* Save/restore rather than reset to NULL: a WHERE/ON/output expression
+       evaluated below may run a nested scalar subquery (another exec_select
+       call) that is itself a whole-query aggregate, which would otherwise
+       clobber this global while we're still mid-aggregation. */
     AggState agg_states[MAX_OUTCOLS];
+    AggState *saved_agg_states = g_agg_states;
     if (se.is_aggregate) {
         memset(agg_states, 0, sizeof(agg_states));
         g_agg_states = agg_states;
@@ -744,6 +1043,8 @@ static int exec_select(Database *db, SelectStmt *sel, ResultSet *rs, char *msg, 
 
     int rc = exec_from_level(&se, 0);
     if (rc != 0) {
+        g_agg_states = saved_agg_states;
+        if (se.is_groupby) free_groups(&se);
         for (int i = 0; i < se.count; i++) {
             for (int j = 0; j < se.num_outcols; j++) value_free(&se.rows[i].proj[j]);
             free(se.rows[i].proj);
@@ -759,21 +1060,26 @@ static int exec_select(Database *db, SelectStmt *sel, ResultSet *rs, char *msg, 
         rs->rows[0] = (Value *)xmalloc(sizeof(Value) * (se.num_outcols > 0 ? se.num_outcols : 1));
         for (int i = 0; i < se.num_outcols; i++) {
             strncpy(rs->column_names[i], se.outcol_name[i], MAX_NAME - 1);
-            Expr *e = se.outcol_expr[i];
-            AggState *st = &agg_states[i];
-            switch (e->as.func.fn) {
-                case FUNC_COUNT: rs->rows[0][i] = value_int(st->count); break;
-                case FUNC_SUM: rs->rows[0][i] = st->any ? value_real(st->sum) : value_null(); break;
-                case FUNC_AVG: rs->rows[0][i] = st->count > 0 ? value_real(st->sum / (double)st->count) : value_null(); break;
-                case FUNC_MIN: rs->rows[0][i] = st->any ? value_clone(&st->minv) : value_null(); break;
-                case FUNC_MAX: rs->rows[0][i] = st->any ? value_clone(&st->maxv) : value_null(); break;
-            }
-            if (st->any && (e->as.func.fn == FUNC_MIN || e->as.func.fn == FUNC_MAX)) value_free(&st->minv), value_free(&st->maxv);
+            rs->rows[0][i] = agg_finalize(se.outcol_expr[i]->as.func.fn, &agg_states[i]);
         }
         rs->num_rows = 1;
-        g_agg_states = NULL;
+        g_agg_states = saved_agg_states;
         snprintf(msg, msgsz, "1 row");
         return 0;
+    }
+
+    if (se.is_groupby) {
+        rc = finalize_groups(&se);
+        free_groups(&se);
+        if (rc != 0) {
+            for (int i = 0; i < se.count; i++) {
+                for (int j = 0; j < se.num_outcols; j++) value_free(&se.rows[i].proj[j]);
+                free(se.rows[i].proj);
+                if (se.rows[i].orderkeys) { for (int j = 0; j < sel->num_orderby; j++) value_free(&se.rows[i].orderkeys[j]); free(se.rows[i].orderkeys); }
+            }
+            free(se.rows);
+            return -1;
+        }
     }
 
     if (sel->num_orderby > 0) {
@@ -809,7 +1115,7 @@ static int exec_select(Database *db, SelectStmt *sel, ResultSet *rs, char *msg, 
 static int collect_matching_rowids(Database *db, TableDef *t, Expr *where, int64_t **out_rowids, int *out_count) {
     BTree tbl; btree_init(&tbl, db->pager, t->root_page, TREE_TABLE);
     BTreeCursor *c = btree_cursor_open(&tbl);
-    RowContext ctx; ctx.num_tables = 1;
+    RowContext ctx; ctx.num_tables = 1; ctx.db = db; ctx.outer = NULL;
     ctx.tables[0].table = t;
     strncpy(ctx.tables[0].alias, t->name, MAX_NAME - 1);
     Value *rowbuf = row_buffer_alloc(t);
@@ -861,7 +1167,7 @@ static int exec_update(Database *db, UpdateStmt *u, char *msg, size_t msgsz) {
         record_deserialize(t, payload, plen, vals);
         free(payload);
 
-        RowContext ctx; ctx.num_tables = 1;
+        RowContext ctx; ctx.num_tables = 1; ctx.db = db; ctx.outer = NULL;
         ctx.tables[0].table = t;
         strncpy(ctx.tables[0].alias, t->name, MAX_NAME - 1);
         ctx.tables[0].values = vals;
@@ -959,7 +1265,7 @@ int execute_statement(Database *db, Stmt *stmt, ResultSet *out_rs, char *msg, si
         case STMT_CREATE_INDEX: return exec_create_index(db, &stmt->as.create_index, msg, msgsz);
         case STMT_DROP_INDEX:   return exec_drop_index(db, &stmt->as.drop_index, msg, msgsz);
         case STMT_INSERT:       return exec_insert(db, &stmt->as.insert, msg, msgsz);
-        case STMT_SELECT:       return exec_select(db, &stmt->as.select, out_rs, msg, msgsz);
+        case STMT_SELECT:       return exec_select(db, &stmt->as.select, out_rs, msg, msgsz, NULL);
         case STMT_UPDATE:       return exec_update(db, &stmt->as.update, msg, msgsz);
         case STMT_DELETE:       return exec_delete(db, &stmt->as.del, msg, msgsz);
         default:

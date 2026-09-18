@@ -42,10 +42,22 @@ To run a script non-interactively:
 - `DROP TABLE t`
 - `CREATE INDEX name ON t(col)` / `DROP INDEX name`
 - `INSERT INTO t [(cols)] VALUES (...), (...)`
-- `SELECT cols|* FROM t [JOIN t2 ON cond ...] [WHERE cond] [ORDER BY col [ASC|DESC], ...] [LIMIT n]`
+- `SELECT cols|* FROM t [JOIN t2 ON cond ...] [WHERE cond] [GROUP BY expr, ...] [HAVING cond] [ORDER BY col [ASC|DESC], ...] [LIMIT n]`
   — expressions support `+ - * /`, comparisons, `AND/OR/NOT`, parentheses,
-  and `COUNT/SUM/AVG/MIN/MAX` (aggregates only, no `GROUP BY`, and a select
-  list must be all-aggregate or all-plain, not mixed).
+  and `COUNT/SUM/AVG/MIN/MAX`. Without `GROUP BY`, a select list must be
+  all-aggregate (one summary row) or all-plain, not mixed. With `GROUP BY`,
+  aggregate and plain columns may be mixed freely (plain columns take the
+  value from an arbitrary row in the group, matching MySQL's non-strict
+  behavior rather than enforcing functional dependency); `HAVING` may
+  reference aggregates not present in the select list, and works standalone
+  (without `GROUP BY`) as a filter over the single whole-table group.
+- Scalar subqueries: `(SELECT ...)` may appear anywhere an expression can, in
+  any statement (`SELECT`/`INSERT`/`UPDATE`/`DELETE`), including nested. It
+  must return exactly one column; zero rows evaluates to `NULL`, more than
+  one row is an error. A subquery may correlate to any enclosing query's
+  columns (e.g. `SELECT name, (SELECT COUNT(*) FROM orders o WHERE
+  o.person_id = p.id) FROM people p`); inner scope shadows outer on a name
+  clash.
 - `UPDATE t SET col = expr, ... [WHERE cond]`
 - `DELETE FROM t [WHERE cond]`
 - `BEGIN [TRANSACTION]` / `COMMIT` / `ROLLBACK` — statements outside an
@@ -99,10 +111,10 @@ recovery) → `main` (REPL).
 
 ## Known limitations
 
-A deliberately "mini" scope: no `GROUP BY`/`HAVING`, subqueries, `ALTER
-TABLE`, views/triggers, foreign key enforcement, `BLOB`/date types,
-multi-connection concurrency, or WAL mode. B-Tree deletes don't rebalance
-underflowing pages (space isn't reclaimed within a page, though whole pages
+A deliberately "mini" scope: no `IN`/`EXISTS`/table-valued subqueries (only
+scalar subqueries), `ALTER TABLE`, views/triggers, foreign key enforcement,
+`BLOB`/date types, multi-connection concurrency, or WAL mode. B-Tree deletes
+don't rebalance underflowing pages (space isn't reclaimed within a page, though whole pages
 are freed when tables/indexes are dropped). Rows and single index keys must
 fit in one 4KB page (a few KB of text max). Parse errors may leak the
 partially-built AST (acceptable for a REPL; not a long-running-process

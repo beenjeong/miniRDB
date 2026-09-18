@@ -6,12 +6,15 @@
 #define MAX_SELECT_ITEMS 32
 #define MAX_JOINS 8
 #define MAX_ORDERBY 8
+#define MAX_GROUPBY 8
 #define MAX_INSERT_ROWS 256
 
 /* ---- expressions ---- */
 
+typedef struct Stmt Stmt; /* forward decl: a subquery expr owns a whole Stmt (kind == STMT_SELECT) */
+
 typedef enum {
-    EXPR_LITERAL, EXPR_COLUMN, EXPR_UNARY, EXPR_BINARY, EXPR_FUNC
+    EXPR_LITERAL, EXPR_COLUMN, EXPR_UNARY, EXPR_BINARY, EXPR_FUNC, EXPR_SUBQUERY
 } ExprKind;
 
 typedef enum {
@@ -30,6 +33,7 @@ typedef struct Expr {
         struct { char table[MAX_NAME]; char column[MAX_NAME]; } column; /* table[0]==0 if unqualified */
         struct { OpKind op; struct Expr *left; struct Expr *right; } bin; /* unary: right==NULL */
         struct { FuncKind fn; struct Expr *arg; bool star; } func; /* star: COUNT(*) */
+        struct { Stmt *stmt; } subquery; /* scalar subquery: (SELECT ...) */
     } as;
 } Expr;
 
@@ -101,6 +105,10 @@ typedef struct {
 
     Expr *where;
 
+    int num_groupby;
+    Expr *groupby[MAX_GROUPBY];
+    Expr *having;
+
     int num_orderby;
     OrderItem orderby[MAX_ORDERBY];
 
@@ -126,7 +134,7 @@ typedef struct {
     Expr *where;
 } DeleteStmt;
 
-typedef struct {
+struct Stmt {
     StmtKind kind;
     union {
         CreateTableStmt create_table;
@@ -138,7 +146,7 @@ typedef struct {
         UpdateStmt update;
         DeleteStmt del;
     } as;
-} Stmt;
+};
 
 void stmt_free(Stmt *s);
 

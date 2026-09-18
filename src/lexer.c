@@ -31,6 +31,7 @@ static const Keyword KEYWORDS[] = {
     {"UPDATE", TOK_UPDATE}, {"SET", TOK_SET}, {"DELETE", TOK_DELETE},
     {"JOIN", TOK_JOIN}, {"INNER", TOK_INNER}, {"ORDER", TOK_ORDER}, {"BY", TOK_BY},
     {"ASC", TOK_ASC}, {"DESC", TOK_DESC}, {"LIMIT", TOK_LIMIT},
+    {"GROUP", TOK_GROUP}, {"HAVING", TOK_HAVING},
     {"AND", TOK_AND}, {"OR", TOK_OR}, {"NOT", TOK_NOT}, {"NULL", TOK_NULL_KW},
     {"PRIMARY", TOK_PRIMARY}, {"KEY", TOK_KEY}, {"AS", TOK_AS},
     {"INT", TOK_INT_TYPE}, {"INTEGER", TOK_INT_TYPE},

@@ -84,6 +84,7 @@ static Value unescape_string(const Token *t) {
 /* ---- expressions ---- */
 
 static Expr *parse_or(Parser *p);
+static Stmt *parse_select(Parser *p);
 
 static Expr *new_expr(void) { return (Expr *)xmalloc(sizeof(Expr)); }
 
@@ -110,6 +111,17 @@ static Expr *parse_primary(Parser *p) {
         return e;
     }
     if (check(p, TOK_LPAREN)) {
+        if (peek(p).type == TOK_SELECT) {
+            advance(p); /* ( */
+            advance(p); /* SELECT */
+            Stmt *sub = parse_select(p);
+            if (!sub) return NULL;
+            if (!expect(p, TOK_RPAREN, ")")) { stmt_free(sub); return NULL; }
+            Expr *e = new_expr();
+            e->kind = EXPR_SUBQUERY;
+            e->as.subquery.stmt = sub;
+            return e;
+        }
         advance(p);
         Expr *e = parse_or(p);
         if (!e) return NULL;
@@ -481,6 +493,23 @@ static Stmt *parse_select(Parser *p) {
         advance(p);
         sel->where = parse_or(p);
         if (!sel->where) goto fail;
+    }
+
+    if (check(p, TOK_GROUP)) {
+        advance(p);
+        if (!expect(p, TOK_BY, "BY")) goto fail;
+        do {
+            if (sel->num_groupby >= MAX_GROUPBY) { set_error("too many GROUP BY items"); p->failed = true; goto fail; }
+            Expr *e = parse_or(p);
+            if (!e) goto fail;
+            sel->groupby[sel->num_groupby++] = e;
+        } while (match(p, TOK_COMMA));
+    }
+
+    if (check(p, TOK_HAVING)) {
+        advance(p);
+        sel->having = parse_or(p);
+        if (!sel->having) goto fail;
     }
 
     if (check(p, TOK_ORDER)) {
